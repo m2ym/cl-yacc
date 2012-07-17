@@ -31,6 +31,22 @@
 
 (in-package #:yacc)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defparameter standard-optimize-settings
+    '(optimize (speed 3) (safety 0) (space 0) (compilation-speed 0) (debug 0))))
+
+(declaim (inline memhash))
+(defun memhash (key hash)
+  (declare #.standard-optimize-settings)
+  (declare (type hash-table hash))
+  (nth-value 1 (gethash key hash)))
+
+(declaim (inline addhash))
+(defun addhash (key hash)
+  (declare #.standard-optimize-settings)
+  (declare (type hash-table hash))
+  (setf (gethash key hash) t))
+
 #-CMU
 (defun required-argument () (error "A required argument was not supplied"))
 
@@ -48,9 +64,9 @@
 ;;; Productions
 
 (defstruct (production
-             (:constructor make-production (symbol derives
-                                            &key action action-form))
-             (:print-function print-production))
+            (:constructor make-production (symbol derives
+                                           &key action action-form))
+            (:print-function print-production))
   (id nil :type (or null index))
   (symbol (required-argument) :type symbol)
   (derives (required-argument) :type list)
@@ -78,16 +94,16 @@
 
 (defstruct (grammar (:constructor %make-grammar))
   (name nil)
-  (terminals '() :type list)
+  (terminals (make-hash-table :test #'eq) :type hash-table)
   (precedence '() :type list)
   (productions '() :type list)
   (%symbols :undefined :type (or list (member :undefined)))
-  (derives-epsilon '() :type list)
-  (derives-first '() :type list)
-  (derives-first-terminal '() :type list))
+  (derives-epsilon (make-hash-table) :type hash-table)
+  (derives-first (make-hash-table) :type hash-table)
+  (derives-first-terminal (make-hash-table) :type hash-table))
 
-(defun make-grammar(&key name (start-symbol (required-argument))
-                    terminals precedence productions)
+(defun make-grammar (&key name (start-symbol (required-argument))
+                          terminals precedence productions)
   (declare (symbol name start-symbol) (list terminals productions))
   (setq productions
         (cons (make-production 's-prime (list start-symbol)
@@ -96,19 +112,28 @@
   (do* ((i 0 (+ i 1)) (ps productions (cdr ps)) (p (car ps) (car ps)))
        ((null ps))
     (setf (production-id p) i))
-  (%make-grammar :name name :terminals terminals :precedence precedence
-                 :productions productions))
+  (let ((term-id 1)
+        (terms (make-hash-table :test #'eq)))
+    (dolist (term terminals)
+      (setf (gethash term terms) term-id)
+      (incf term-id))
+    (%make-grammar :name name
+                   :terminals terms
+                   :precedence precedence
+                   :productions productions)))
 
 (defun grammar-discard-memos (grammar)
   (setf (grammar-%symbols grammar) :undefined)
-  (setf (grammar-derives-epsilon grammar) '())
-  (setf (grammar-derives-first grammar) '())
-  (setf (grammar-derives-first-terminal grammar) '()))
+  (setf (grammar-derives-epsilon grammar) (make-hash-table))
+  (setf (grammar-derives-first grammar) (make-hash-table))
+  (setf (grammar-derives-first-terminal grammar) (make-hash-table)))
 
+(declaim (inline terminal-p))
 (defun terminal-p (symbol grammar)
+  (declare #.standard-optimize-settings)
   (declare (symbol symbol) (type grammar grammar))
   (or (eq symbol 'propagate)
-      (and (member symbol (grammar-terminals grammar)) t)))
+      (memhash symbol (grammar-terminals grammar))))
 
 (defun grammar-symbols (grammar)
   "The set of symbols (both terminal and nonterminal) of GRAMMAR."
@@ -130,21 +155,23 @@
 
 (defun derives-epsilon (symbol grammar &optional seen)
   "True if symbol derives epsilon."
+  (declare #.standard-optimize-settings)
   (declare (symbol symbol) (type grammar grammar) (list seen))
-  (let ((e (assoc symbol (grammar-derives-epsilon grammar))))
+  (multiple-value-bind (e present-p)
+      (gethash symbol (grammar-derives-epsilon grammar))
     (cond
-      (e (cdr e))
+      (present-p e)
       ((terminal-p symbol grammar) nil)
       ((member symbol seen) nil)
       (t
        (let ((res (derives-epsilon* symbol grammar (cons symbol seen))))
          (when (or res (null seen))
-           (setf (grammar-derives-epsilon grammar)
-                 (acons symbol res (grammar-derives-epsilon grammar))))
+           (setf (gethash symbol (grammar-derives-epsilon grammar)) res))
          res)))))
 
 (defun derives-epsilon* (symbol grammar &optional seen)
   "Unmemoised version of DERIVES-EPSILON."
+  (declare #.standard-optimize-settings)
   (declare (symbol symbol) (type grammar grammar) (list seen))
   (dolist (production (grammar-productions grammar))
     (when (and (eq symbol (production-symbol production))
@@ -154,6 +181,7 @@
 
 (defun sequence-derives-epsilon (sequence grammar)
   "Sequence version of DERIVES-EPSILON*."
+  (declare #.standard-optimize-settings)
   (declare (list sequence) (type grammar grammar))
   (every #'(lambda (s) (derives-epsilon s grammar)) sequence))
 
@@ -170,10 +198,12 @@
 
 (defun derives-first (c grammar &optional seen)
   "The list of symbols A such that C rm->* A.eta for some eta."
+  (declare #.standard-optimize-settings)
   (declare (symbol c) (type grammar grammar) (list seen))
-  (let ((e (assoc c (grammar-derives-first grammar))))
+  (multiple-value-bind (e present-p)
+      (gethash c (grammar-derives-first grammar))
     (cond
-      (e (the list (cdr e)))
+      (present-p (the list e))
       ((terminal-p c grammar) (list c))
       ((member c seen) '())
       (t
@@ -187,12 +217,12 @@
                            (cons c seen))
                           derives))))
          (when (null seen)
-           (setf (grammar-derives-first grammar)
-                 (acons c derives (grammar-derives-first grammar))))
+           (setf (gethash c (grammar-derives-first grammar)) derives))
          derives)))))
 
 (defun sequence-derives-first (sequence grammar &optional seen)
   "Sequence version of DERIVES-FIRST."
+  (declare #.standard-optimize-settings)
   (declare (list sequence) (type grammar grammar) (list seen))
   (cond
     ((null sequence) '())
@@ -205,10 +235,12 @@
 
 (defun derives-first-terminal (c grammar &optional seen)
   "The list of terminals a such that C rm->* a.eta, last non-epsilon."
+  (declare #.standard-optimize-settings)
   (declare (symbol c) (type grammar grammar))
-  (let ((e (assoc c (grammar-derives-first-terminal grammar))))
+  (multiple-value-bind (e present-p)
+      (gethash c (grammar-derives-first-terminal grammar))
     (cond
-      (e (the list (cdr e)))
+      (present-p (the list e))
       ((terminal-p c grammar) (list c))
       ((member c seen) '())
       (t
@@ -222,19 +254,23 @@
                      (production-derives production) grammar (cons c seen))
                     derives))))
          (when (null seen)
-           (push (cons c derives) (grammar-derives-first-terminal grammar)))
+           (setf (gethash c (grammar-derives-first-terminal grammar)) derives))
          derives)))))
 
 (defun sequence-derives-first-terminal (sequence grammar &optional seen)
   "Sequence version of DERIVES-FIRST-TERMINAL."
+  (declare #.standard-optimize-settings)
   (declare (list sequence) (type grammar grammar) (list seen))
   (cond
     ((null sequence) '())
     (t
      (derives-first-terminal (car sequence) grammar seen))))
 
+(declaim (inline first-terminals))
+
 (defun first-terminals (s grammar)
   "FIRST(s) without epsilon."
+  (declare #.standard-optimize-settings)
   (declare (atom s) (type grammar grammar))
   (cond
     ((terminal-p s grammar) (list s))
@@ -243,6 +279,7 @@
 
 (defun sequence-first-terminals (s grammar)
   "Sequence version of FIRST-TERMINALS."
+  (declare #.standard-optimize-settings)
   (declare (list s) (type grammar grammar))
   (cond
     ((null s) '())
@@ -310,23 +347,23 @@
 ;;; Items
 
 (defstruct (item
-             (:constructor nil)
-             (:print-function print-item)
-             (:copier %copy-item))
+            (:constructor nil)
+            (:print-function print-item)
+            (:copier %copy-item))
   (production (required-argument) :type production)
   (position (required-argument) :type index))
 
 (defstruct (lr0-item
-             (:include item)
-             (:constructor make-item (production position))
-             (:conc-name item-))
+            (:include item)
+            (:constructor make-item (production position))
+            (:conc-name item-))
   (lookaheads '() :type list))
 
 (defstruct (lr1-item
-             (:include item)
-             (:constructor make-lr1-item
-                           (production position lookahead))
-             (:conc-name item-))
+            (:include item)
+            (:constructor make-lr1-item
+                (production position lookahead))
+            (:conc-name item-))
   (lookahead (required-argument) :type symbol))
 
 (defun print-item (i s d)
@@ -491,7 +528,7 @@
 
 (defun lr1-find (item collection)
   "Find an LR(1) item equal to ITEM in COLLECTION, or NIL."
-  (declare (optimize (speed 3) (space 0)))
+  (declare #.standard-optimize-settings)
   (declare (type item item) (type lr1-collection collection))
   (typecase collection
     (list (find item collection :test #'item-lr1-equal-p))
@@ -517,6 +554,7 @@
 
 (defun lr1-add (item collection)
   "Add ITEM to COLLECTION."
+  (declare #.standard-optimize-settings)
   (declare (type lr1-item item) (type lr1-collection collection))
   (typecase collection
     (list (cons item collection))
@@ -545,10 +583,11 @@
 
 (defun items-closure (items grammar)
   "Compute the closure of a set of LR(1) items."
+  (declare #.standard-optimize-settings)
   (declare (list items) (type grammar grammar))
-  (let ((res '()) (n 0)
+  (let ((res '())
+        (n 0)
         (threshold *items-closure-hash-threshold*))
-    (declare (optimize (speed 3) (space 0)))
     (declare (type index n) (type (or list hash-table) res))
     (labels ((add (item)
                (declare (type lr1-item item))
@@ -563,10 +602,10 @@
                      (dolist (production (grammar-productions grammar))
                        (when (eq (production-symbol production) dot-symbol)
                          (dolist (terminal
-                                   (sequence-first-terminals
-                                    (append (item-dot-right item 1)
-                                            (list (item-lookahead item)))
-                                    grammar))
+                                  (sequence-first-terminals
+                                   (append (item-dot-right item 1)
+                                           (list (item-lookahead item)))
+                                   grammar))
                            (add (make-lr1-item production 0 terminal))))))))))
       (mapc #'add items)
       res)))
@@ -581,29 +620,32 @@
 (declaim (inline goto-equal-p find-goto))
 
 (defun goto-equal-p (g1 g2)
+  (declare #.standard-optimize-settings)
   (declare (type goto g1 g2))
   (and (eq (goto-symbol g1) (goto-symbol g2))
        ;; kernels are interned -- see make-kernel.
        (eq (goto-target g1) (goto-target g2))))
 
 (defun find-goto (kernel symbol)
+  (declare #.standard-optimize-settings)
   (declare (type kernel kernel) (symbol symbol))
   (find symbol (kernel-gotos kernel) :key #'goto-symbol))
 
 (defun compute-goto (kernel symbol grammar)
   "Compute the kernel of goto(KERNEL, SYMBOL)"
+  (declare #.standard-optimize-settings)
+  (declare (optimize (safety 0)))
   (declare (type kernel kernel) (symbol symbol) (type grammar grammar))
   (let ((result '()))
     (dolist (item (kernel-items kernel))
       (when (not (item-dot-right-p item))
-        (let ((c (item-dot-symbol item)))
+        (let* ((c (item-dot-symbol item))
+               (first (derives-first c grammar)))
           (when (eq c symbol)
             (pushnew (item-shift item) result :test #'item-equal-p))
           (dolist (production (grammar-productions grammar))
-            (when (and (not (null (production-derives production)))
-                       (eq symbol (car (production-derives production)))
-                       (member (production-symbol production)
-                               (derives-first c grammar)))
+            (when (and (eq symbol (car (production-derives production)))
+                       (memq (production-symbol production) first))
               (pushnew (make-item production 1) result
                        :test #'item-equal-p))))))
     result))
@@ -664,46 +706,51 @@ If PROPAGATE-ONLY is true, ignore spontaneous generation."
 
 (defun compute-all-lookaheads (kernels grammar)
   "Compute the LR(1) lookaheads for all the collections in KERNELS."
+  (declare #.standard-optimize-settings)
   (declare (list kernels) (type grammar grammar))
   (setf (item-lookaheads (kernel-item (car kernels))) (list 'yacc-eof-symbol))
-  (let ((previously-changed kernels) (changed '())
+  (let ((previously-changed (make-hash-table :test #'eq))
+        (changed (make-hash-table :test #'eq))
         (propagate-only nil))
-    (declare (optimize (speed 3) (space 0)))
+    (dolist (kernel kernels)
+      (addhash kernel previously-changed))
     (loop
-     (dolist (kernel kernels)
-       (when (memq kernel previously-changed)
-         (let ((lookaheads (compute-lookaheads kernel grammar propagate-only)))
-           (declare (list lookaheads))
-           (dolist (goto (kernel-gotos kernel))
-             (declare (type goto goto))
-             (let ((target (goto-target goto)) (new nil))
-               (flet ((new-lookahead (item lookahead)
-                        (declare (type lr1-item item) (symbol lookahead))
-                        (let ((i (find item (kernel-items target)
-                                       :test #'item-equal-p)))
-                          (when i
-                            (unless (memq lookahead (item-lookaheads i))
-                              (push lookahead (item-lookaheads i))
-                              (setq new t))))))
-                 (dolist (e lookaheads)
-                   (let ((i (car e)) (ni (cdr e)))
-                     (declare (type lr0-item i) (type lr1-item ni))
-                     (cond
-                       ((eq 'propagate (item-lookahead ni))
-                        ;; propagate
-                        (let ((item (find i (kernel-items kernel)
-                                          :test #'item-equal-p)))
-                          (when item
-                            (dolist (s (item-lookaheads item))
-                              (new-lookahead ni s)))))
-                       (t
-                        ;; spontaneous generation
-                        (new-lookahead ni (item-lookahead ni)))))))
-               (when new
-                 (pushnew target changed)))))))
-     (unless changed (return))
-     (psetq previously-changed changed changed '()
-            propagate-only t)))
+      (dolist (kernel kernels)
+        (when (memhash kernel previously-changed)
+          (let ((lookaheads (compute-lookaheads kernel grammar propagate-only)))
+            (declare (list lookaheads))
+            (dolist (goto (kernel-gotos kernel))
+              (declare (type goto goto))
+              (let ((target (goto-target goto)) (new nil))
+                (flet ((new-lookahead (item lookahead)
+                         (declare (type lr1-item item) (symbol lookahead))
+                         (let ((i (find item (kernel-items target)
+                                        :test #'item-equal-p)))
+                           (when i
+                             (unless (memq lookahead (item-lookaheads i))
+                               (push lookahead (item-lookaheads i))
+                               (setq new t))))))
+                  (dolist (e lookaheads)
+                    (let ((i (car e)) (ni (cdr e)))
+                      (declare (type lr0-item i) (type lr1-item ni))
+                      (cond
+                        ((eq 'propagate (item-lookahead ni))
+                         ;; propagate
+                         (let ((item (find i (kernel-items kernel)
+                                           :test #'item-equal-p)))
+                           (when item
+                             (dolist (s (item-lookaheads item))
+                               (new-lookahead ni s)))))
+                        (t
+                         ;; spontaneous generation
+                         (new-lookahead ni (item-lookahead ni)))))))
+                (when new
+                  (addhash target changed)))))))
+      (when (zerop (hash-table-count changed))
+        (return))
+      (rotatef previously-changed changed)
+      (clrhash changed)
+      (setq propagate-only t)))
   kernels)
 
 (defun print-states (kernels lookaheads &optional (stream *standard-output*))
@@ -830,10 +877,11 @@ If PROPAGATE-ONLY is true, ignore spontaneous generation."
                      (conflict-summary-warning-shift-reduce w)
                      (conflict-summary-warning-reduce-reduce w)))))
 
-(defstruct (parser (:constructor %make-parser (states goto action)))
+(defstruct (parser (:constructor %make-parser (states goto action reduction)))
   (states (required-argument) :type index)
   (goto (required-argument) :type simple-vector)
-  (action (required-argument) :type simple-vector))
+  (action (required-argument) :type simple-vector)
+  (reduction (required-argument) :type simple-vector))
 
 (defun find-precedence (op precedence)
   "Return the tail of PRECEDENCE starting with the element containing OP.
@@ -908,6 +956,7 @@ or a list of the form (sr rr)."
   (let ((numkernels (length kernels)))
     (let ((goto (make-array numkernels :initial-element '()))
           (action (make-array numkernels :initial-element '()))
+          (reduction (make-array numkernels :initial-element nil))
           (sr-conflicts 0) (rr-conflicts 0)
           (epsilon-productions (grammar-epsilon-productions grammar))
           (action-productions '()))
@@ -996,7 +1045,14 @@ or a list of the form (sr rr)."
                  ))))
           (dolist (g (kernel-gotos k))
             (when (not (terminal-p (goto-symbol g) grammar))
-              (set-goto k (list (goto-symbol g)) (goto-target g))))))
+              (set-goto k (list (goto-symbol g)) (goto-target g)))))
+        (dolist (k kernels)
+          (let* ((i (kernel-id k))
+                 (alist (mapcar #'cdr (aref action i))))
+            (when (every #'action-equal-p alist (cdr alist))
+              (let ((a (first alist)))
+                (when (reduce-action-p a)
+                  (setf (aref reduction i) a)))))))
       (when (null muffle-conflicts) (setq muffle-conflicts '(0 0)))
       (unless (or (eq t muffle-conflicts)
                   (and (consp muffle-conflicts)
@@ -1005,7 +1061,7 @@ or a list of the form (sr rr)."
         (warn (make-condition 'conflict-summary-warning
                               :shift-reduce sr-conflicts
                               :reduce-reduce rr-conflicts)))
-      (%make-parser numkernels goto action))))
+      (%make-parser numkernels goto action reduction))))
 
 (defun make-parser (grammar
                     &key (discard-memos t) (muffle-conflicts nil)
@@ -1055,27 +1111,35 @@ Handle YACC-PARSE-ERROR to provide custom error reporting."
   (declare (type (function () (values symbol t)) lexer))
   (declare (type parser parser))
   (let ((action-array (parser-action parser))
+        (reduction-array (parser-reduction parser))
         (goto-array (parser-goto parser)))
     (flet ((action (i a)
              (declare (type index i) (symbol a))
              (cdr (assoc a (aref action-array i))))
+           (reduction (i)
+             (declare (type index i))
+             (aref reduction-array i))
            (goto (i a)
              (declare (type index i) (symbol a))
              (or (cdr (assoc a (aref goto-array i)))
                  (error "This cannot happen."))))
-      (let ((stack (list 0)) symbol value)
+      (let ((stack (list 0)) symbol value (read-symbol t))
         (flet ((next-symbol ()
                  (multiple-value-bind (s v) (funcall lexer)
                    (setq symbol (or s 'yacc-eof-symbol) value v))))
-          (next-symbol)
           (loop
            (let* ((state (car stack))
-                  (action (action state symbol)))
+                  (action (reduction state)))
+             (unless action
+               (when read-symbol
+                 (next-symbol)
+                 (setq read-symbol nil))
+               (setq action (action state symbol)))
              (etypecase action
                (shift-action
                 (push value stack)
                 (push (shift-action-state action) stack)
-                (next-symbol))
+                (setq read-symbol t))
                (reduce-action
                 (let ((vals '()))
                   (dotimes (n (reduce-action-length action))
@@ -1111,28 +1175,17 @@ Handle YACC-PARSE-ERROR to provide custom error reporting."
     (dolist (stuff (cdr form))
       (cond
         ((and (symbolp stuff) (not (null stuff)))
-         (push (make-production symbol (list stuff)
-                                :action #'identity :action-form '#'identity)
+         (push `(make-production ',symbol ',(list stuff)
+                                 :action #'identity
+                                 :action-form '#'identity)
                productions))
-        ((and (listp stuff)
-              (not (null (car stuff)))
-              (listp (car stuff)))
-         (let* ((rhs (car stuff))
-                (body (cdr stuff))
-                (args (loop for i from 1 to (length rhs)
-                            collect (intern (format nil "$~D" i) *package*)))
-                (action `(lambda ,args (declare (ignorable ,@args)) ,@body)))
-           (push (make-production symbol rhs
-                                  :action (eval action)
-                                  :action-form action)
-                 productions)))
         ((listp stuff)
          (let ((l (car (last stuff))))
            (let ((rhs (if (symbolp l) stuff (butlast stuff)))
                  (action (if (symbolp l) '#'list l)))
-             (push (make-production symbol rhs
-                     :action (eval action)
-                     :action-form action)
+             (push `(make-production ',symbol ',rhs
+                                     :action ,action
+                                     :action-form ',action)
                    productions))))
         (t (error "Unexpected production ~S" stuff))))
     productions))
@@ -1171,10 +1224,10 @@ MAKE-GRAMMAR."
     (unless (null make-options)
       (warn "DEFINE-GRAMMAR ignores options ~S" make-options))
     `(defparameter ,name
-      ',(apply #'make-grammar
-               :name name
-               :productions productions
-               options))))
+       (apply #'make-grammar
+        :name ',name
+        :productions (list ,@productions)
+        ',options))))
 
 (defmacro define-parser (name &body body)
   "DEFINE-GRAMMAR NAME OPTION... PRODUCTION...
@@ -1184,12 +1237,12 @@ Defines the special variable NAME to be a parser.  Options are as in
 MAKE-GRAMMAR and MAKE-PARSER."
   (multiple-value-bind (options make-options productions) (parse-grammar body)
     `(defparameter ,name
-      ',(apply #'make-parser
-               (apply #'make-grammar
-                      :name name
-                      :productions productions
-                      options)
-               make-options))))
+       (apply #'make-parser
+        (apply #'make-grammar
+         :name ',name
+         :productions (list ,@productions)
+         ',options)
+        ',make-options))))
 
 ;;; Support for fasdumping grammars and parsers.
 
